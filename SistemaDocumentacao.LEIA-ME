@@ -1,0 +1,30 @@
+TI Central — inicialização
+
+Requisitos
+- Python 3.10 ou superior (sem pacotes adicionais).
+
+Como iniciar
+1. Abra o PowerShell nesta pasta.
+2. Execute: py server.py
+3. Acesse: http://127.0.0.1:8080
+4. No primeiro acesso, crie a conta de administrador. Use uma senha única com pelo menos 12 caracteres.
+
+Banco de dados
+- Na primeira inicialização, o sistema cria data/ti_central.sqlite3.
+- A tabela users armazena contas, perfis e hashes de senha PBKDF2; sessions armazena sessões com prazo de expiração.
+- ip_assignments mantém setor, funcionário, IP, dispositivo, MAC, local e observações. O IP é validado e não pode repetir.
+- app_records armazena os registros dos demais módulos.
+- Faça cópias de segurança do arquivo SQLite com o servidor parado.
+
+Acesso de outros computadores
+- Para uma demonstração em rede local, inicie com: py server.py --host 0.0.0.0 --port 8080
+- Libere a porta 8080 apenas na rede interna e acesse http://IP-DO-SERVIDOR:8080.
+- Para uso permanente com múltiplas pessoas, publique atrás de HTTPS (proxy reverso), restrinja o acesso à rede corporativa e inclua rotina de backup do SQLite. O servidor de demonstração usa HTTP e não deve ser exposto à Internet.
+
+Perfis
+- Administrador: gerencia usuários, perfis e dados.
+- Técnico: opera cadastros e chamados.
+- Consulta: leitura dos módulos.
+
+Observação
+Esta é uma base funcional para implantação inicial, não uma integração com o TOTVS RM. A conexão com diretório corporativo, permissões detalhadas por setor, auditoria e cópia de segurança precisam ser configuradas conforme a política da empresa.

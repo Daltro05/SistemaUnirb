@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""TI Central: servidor local com SQLite, autenticação e API."""
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
+import argparse, hashlib, hmac, json, os, secrets, sqlite3, time
+from urllib.parse import urlparse, unquote
+
+BASE = Path(__file__).resolve().parent
+DB = BASE / "data" / "ti_central.sqlite3"
+DB.parent.mkdir(exist_ok=True)
+ENTITIES = {"machines", "supplies", "tickets", "network", "locations"}
+
+def connect():
+    c = sqlite3.connect(DB, timeout=15)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    return c
+
+def init_db():
+    with connect() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          display_name TEXT NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'tecnico', active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS sessions (
+          token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          expires_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS ip_assignments (
+          id INTEGER PRIMARY KEY, setor TEXT NOT NULL, funcionario TEXT NOT NULL,
+          ip TEXT NOT NULL UNIQUE, dispositivo TEXT DEFAULT '', mac TEXT DEFAULT '',
+          local TEXT DEFAULT '', observacoes TEXT DEFAULT '',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS app_records (
+          id INTEGER PRIMARY KEY, entity TEXT NOT NULL, payload TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE INDEX IF NOT EXISTS records_entity ON app_records(entity);
+        """)
+
+def password_hash(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 310000).hex()
+    return salt, digest
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(BASE), **kwargs)
+
+    def log_message(self, fmt, *args):
+        print("[%s] %s" % (self.log_date_time_string(), fmt % args))
+
+    def json(self, status, data, headers=None):
+        body = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store")
+        if headers:
+            for k, v in headers.items(): self.send_header(k, v)
+        self.end_headers(); self.wfile.write(body)
+
+    def read_body(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        if n > 1_000_000: raise ValueError("Corpo muito grande")
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def token(self):
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "ti_session": return v
+        return ""
+
+    def current_user(self):
+        token = self.token()
+        if not token: return None
+        key = hashlib.sha256(token.encode()).hexdigest()
+        with connect() as c:
+            row = c.execute("SELECT u.id,u.username,u.display_name,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?", (key, int(time.time()))).fetchone()
+            if row and row["active"]: return dict(row)
+        return None
+
+    def require_user(self, admin=False):
+        user = self.current_user()
+        if not user:
+            self.json(401, {"error": "Faça login para continuar."}); return None
+        if admin and user["role"] != "admin":
+            self.json(403, {"error": "Apenas administradores podem gerenciar usuários."}); return None
+        return user
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path.startswith("/api/"):
+            with connect() as c:
+                if path == "/api/setup-status":
+                    n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                    return self.json(200, {"setup_required": n == 0})
+            user = self.require_user()
+            if not user: return
+            if path == "/api/me": return self.json(200, {"user": user})
+            if path == "/api/users":
+                if user["role"] != "admin": return self.json(403, {"error":"Sem permissão."})
+                with connect() as c:
+                    rows = c.execute("SELECT id,username,display_name,role,active,created_at FROM users ORDER BY display_name").fetchall()
+                return self.json(200, [dict(x) for x in rows])
+            if path.startswith("/api/data/"):
+                entity = unquote(path.rsplit("/",1)[1])
+                if entity == "ips":
+                    with connect() as c: rows = c.execute("SELECT id,setor,funcionario,ip,dispositivo,mac,local,observacoes FROM ip_assignments ORDER BY setor,funcionario").fetchall()
+                    return self.json(200, [dict(x) for x in rows])
+                if entity not in ENTITIES: return self.json(404, {"error":"Módulo inexistente."})
+                with connect() as c: rows = c.execute("SELECT id,payload FROM app_records WHERE entity=? ORDER BY id DESC", (entity,)).fetchall()
+                return self.json(200, [{"record_id":r["id"], **json.loads(r["payload"])} for r in rows])
+            return self.json(404, {"error":"Rota inexistente."})
+        # Do not expose the Python source or the SQLite file as static files.
+        if path not in ("/", "/index.html"):
+            return self.send_error(404)
+        return super().do_GET()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try: data = self.read_body()
+        except Exception: return self.json(400, {"error":"Dados inválidos."})
+        if path == "/api/setup":
+            username = str(data.get("username", "")).strip(); name = str(data.get("display_name", "")).strip(); pw = str(data.get("password", ""))
+            if len(username)<3 or len(name)<2 or len(pw)<12: return self.json(400,{"error":"Informe usuário, nome e senha com pelo menos 12 caracteres."})
+            with connect() as c:
+                if c.execute("SELECT COUNT(*) FROM users").fetchone()[0]: return self.json(409,{"error":"O administrador inicial já foi criado."})
+                salt,digest=password_hash(pw); c.execute("INSERT INTO users(username,display_name,password_hash,salt,role) VALUES(?,?,?,?, 'admin')",(username,name,digest,salt))
+            return self.login(username,pw)
+        if path == "/api/login": return self.login(str(data.get("username","")),str(data.get("password","")))
+        if path == "/api/logout":
+            tok=self.token()
+            if tok:
+                with connect() as c: c.execute("DELETE FROM sessions WHERE token_hash=?",(hashlib.sha256(tok.encode()).hexdigest(),))
+            return self.json(200,{"ok":True}, {"Set-Cookie":"ti_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
+        user=self.require_user(admin=path.startswith("/api/users"))
+        if not user:return
+        if user["role"] == "consulta": return self.json(403,{"error":"Perfil de consulta não pode alterar dados."})
+        if path=="/api/users":
+            uname=str(data.get("username","")).strip(); name=str(data.get("display_name","")).strip(); pw=str(data.get("password","")); role=data.get("role","tecnico")
+            if len(uname)<3 or len(name)<2 or len(pw)<12 or role not in ("admin","tecnico","consulta"):return self.json(400,{"error":"Confira os campos. A senha deve ter pelo menos 12 caracteres."})
+            salt,digest=password_hash(pw)
+            try:
+                with connect() as c:c.execute("INSERT INTO users(username,display_name,password_hash,salt,role) VALUES(?,?,?,?,?)",(uname,name,digest,salt,role))
+            except sqlite3.IntegrityError:return self.json(409,{"error":"Este usuário já existe."})
+            return self.json(201,{"ok":True})
+        if path == "/api/data/ips":
+            keys=["setor","funcionario","ip","dispositivo","mac","local","observacoes"]
+            vals=[str(data.get(k,"")).strip() for k in keys]
+            if any(not vals[i] for i in (0,1,2)):return self.json(400,{"error":"Setor, funcionário e IP são obrigatórios."})
+            import ipaddress
+            try: ipaddress.ip_address(vals[2])
+            except ValueError:return self.json(400,{"error":"Informe um endereço IPv4 ou IPv6 válido."})
+            try:
+                with connect() as c:c.execute("INSERT INTO ip_assignments(setor,funcionario,ip,dispositivo,mac,local,observacoes) VALUES(?,?,?,?,?,?,?)",vals)
+            except sqlite3.IntegrityError:return self.json(409,{"error":"Este IP já está cadastrado."})
+            return self.json(201,{"ok":True})
+        if path.startswith("/api/data/"):
+            entity=unquote(path.rsplit("/",1)[1])
+            if entity not in ENTITIES:return self.json(404,{"error":"Módulo inexistente."})
+            payload={k:v for k,v in data.items() if k!="id"}
+            with connect() as c:c.execute("INSERT INTO app_records(entity,payload) VALUES(?,?)",(entity,json.dumps(payload,ensure_ascii=False)))
+            return self.json(201,{"ok":True})
+        return self.json(404,{"error":"Rota inexistente."})
+
+    def login(self, username, password):
+        with connect() as c: row=c.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE AND active=1",(username.strip(),)).fetchone()
+        if not row:return self.json(401,{"error":"Usuário ou senha inválidos."})
+        _,digest=password_hash(password,row["salt"])
+        if not hmac.compare_digest(digest,row["password_hash"]):return self.json(401,{"error":"Usuário ou senha inválidos."})
+        token=secrets.token_urlsafe(32); hashed=hashlib.sha256(token.encode()).hexdigest()
+        with connect() as c:c.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)",(hashed,row["id"],int(time.time())+43200))
+        user={"id":row["id"],"username":row["username"],"display_name":row["display_name"],"role":row["role"]}
+        return self.json(200,{"user":user},{"Set-Cookie":f"ti_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"})
+
+    def do_PATCH(self):
+        path=urlparse(self.path).path
+        user=self.require_user(admin=path.startswith("/api/users/"))
+        if not user:return
+        if user["role"] == "consulta": return self.json(403,{"error":"Perfil de consulta não pode alterar dados."})
+        try:data=self.read_body()
+        except Exception:return self.json(400,{"error":"Dados inválidos."})
+        parts=path.strip("/").split("/")
+        if len(parts)==3 and parts[:2]==["api","users"]:
+            try: uid=int(parts[2])
+            except ValueError:return self.json(400,{"error":"ID inválido."})
+            with connect() as c:
+                target=c.execute("SELECT id FROM users WHERE id=?",(uid,)).fetchone()
+                if not target:return self.json(404,{"error":"Usuário não encontrado."})
+                if "active" in data:c.execute("UPDATE users SET active=? WHERE id=?",(1 if data["active"] else 0,uid))
+                if data.get("role") in ("admin","tecnico","consulta"):c.execute("UPDATE users SET role=? WHERE id=?",(data["role"],uid))
+                if data.get("password"):
+                    if len(data["password"])<12:return self.json(400,{"error":"A senha deve ter pelo menos 12 caracteres."})
+                    salt,digest=password_hash(data["password"]);c.execute("UPDATE users SET salt=?,password_hash=? WHERE id=?",(salt,digest,uid))
+            return self.json(200,{"ok":True})
+        if len(parts)==4 and parts[:2]==["api","tickets"] and parts[3]=="status":
+            try: tid=int(parts[2])
+            except ValueError:return self.json(400,{"error":"ID inválido."})
+            status=data.get("status")
+            if status not in ("Aberto","Em atendimento","Aguardando usuário","Resolvido"):return self.json(400,{"error":"Status inválido."})
+            with connect() as c:
+                row=c.execute("SELECT payload FROM app_records WHERE id=? AND entity='tickets'",(tid,)).fetchone()
+                if not row:return self.json(404,{"error":"Chamado inexistente."})
+                obj=json.loads(row[0]);obj["status"]=status;c.execute("UPDATE app_records SET payload=? WHERE id=?",(json.dumps(obj,ensure_ascii=False),tid))
+            return self.json(200,{"ok":True})
+        return self.json(404,{"error":"Rota inexistente."})
+
+    def do_DELETE(self):
+        user=self.require_user()
+        if not user:return
+        if user["role"] == "consulta": return self.json(403,{"error":"Perfil de consulta não pode excluir dados."})
+        parts=urlparse(self.path).path.strip("/").split("/")
+        if len(parts)!=4 or parts[:2]!=["api","data"]:return self.json(404,{"error":"Rota inexistente."})
+        entity=unquote(parts[2])
+        try:item_id=int(parts[3])
+        except ValueError:return self.json(400,{"error":"ID inválido."})
+        if entity=="ips":table="ip_assignments"
+        elif entity in ENTITIES:table="app_records"
+        else:return self.json(404,{"error":"Módulo inexistente."})
+        with connect() as c:
+            if entity=="ips":cur=c.execute("DELETE FROM ip_assignments WHERE id=?",(item_id,))
+            else:cur=c.execute("DELETE FROM app_records WHERE id=? AND entity=?",(item_id,entity))
+        return self.json(200 if cur.rowcount else 404,{"ok":bool(cur.rowcount)})
+
+if __name__ == "__main__":
+    init_db()
+    parser=argparse.ArgumentParser();parser.add_argument("--host",default="127.0.0.1");parser.add_argument("--port",type=int,default=8080);args=parser.parse_args()
+    server=ThreadingHTTPServer((args.host,args.port),Handler)
+    print(f"TI Central disponível em http://{args.host}:{args.port}  (SQLite: {DB})")
+    try:server.serve_forever()
+    except KeyboardInterrupt:print("\nServidor encerrado.")
